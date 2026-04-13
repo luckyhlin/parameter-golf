@@ -229,3 +229,141 @@ Imagine 8 people (heads) working on a group essay, each writing a paragraph (the
 ### GQA specifically: why share KV heads?
 
 The hypothesis: the "what to look for" (Q) needs more diversity than "what's available to look at" (K) or "what to retrieve" (V). Two query heads sharing one KV head can still compute different attention patterns because their different $W_Q^{(i)}$ projections weight the shared key-space differently. Empirically, GQA with $h_\text{kv} = h/2$ loses very little quality vs. full MHA while saving 25% of attention parameters — valuable when you're constrained to 16MB.
+
+### GQA implementation: how head sharing works in practice
+
+Q has shape $(B, h, T, d_k) = (B, 8, T, 64)$, K and V have $(B, h_\text{kv}, T, d_k) = (B, 4, T, 64)$. The head counts don't match.
+
+`F.scaled_dot_product_attention` with `enable_gqa=True` groups query heads in chunks of $h / h_\text{kv} = 2$:
+
+    Q heads 0, 1   share   K/V head 0
+    Q heads 2, 3   share   K/V head 1
+    Q heads 4, 5   share   K/V head 2
+    Q heads 6, 7   share   K/V head 3
+
+Inside the Flash Attention CUDA kernel, this is **stride-based** — when computing attention for Q head $i$, the kernel reads K/V from head index $\lfloor i \cdot h_\text{kv} / h \rfloor$. No memory is duplicated; the kernel just indexes K/V differently per query head.
+
+Before PyTorch added `enable_gqa`, the manual approach was to explicitly copy K/V:
+
+    k = k.repeat_interleave(h // h_kv, dim=1)   # (B, 4, T, 64) → (B, 8, T, 64)
+    v = v.repeat_interleave(h // h_kv, dim=1)   # wasteful memory copy
+
+The `enable_gqa` flag achieves the same result without materializing the repeated tensors.
+
+---
+
+## Tensor shapes: how `bsz` arises and flows through the model
+
+### Data loader creates the batch dimension (train_gpt.py, lines 486-494)
+
+The token stream is a flat 1D array. `next_batch` carves out a chunk and reshapes:
+
+    local_tokens = train_batch_tokens / (world_size × grad_accum_steps)
+                 = 524,288 / (1 × 8)  = 65,536   (single GPU)
+
+    local: shape (65,537,)                      # flat 1D, +1 for the shift
+    x = local[:-1].reshape(-1, seq_len)         # (65,536,).reshape(-1, 1024) → (64, 1024)
+    y = local[1:].reshape(-1, seq_len)          # same → (64, 1024)
+
+Nobody explicitly sets $B = 64$. It falls out of:
+
+$$B = \frac{\text{local\_tokens}}{\text{seq\_len}} = \frac{65{,}536}{1024} = 64$$
+
+`x` and `y` are both `torch.Tensor` with dtype `int64` and shape $(B, T)$.
+
+### Embedding adds the model dimension (train_gpt.py, line 701)
+
+    input_ids: (64, 1024)        int64 — 2D tensor of token IDs
+    tok_emb(input_ids): (64, 1024, 512)  float — each int replaced by its 512-dim vector
+
+This is how $(B, T)$ of integers becomes $(B, T, d_\text{model})$ of floats. The shape $(B, T, d_\text{model})$ propagates unchanged through every Block until the final norm.
+
+### Type system: Tensor vs nn.Parameter
+
+Everything in the model is a `Tensor`. `nn.Parameter` is a subclass of `Tensor` with one distinction: it registers itself with the module so the optimizer can find it via `.parameters()`.
+
+    nn.Parameter ⊂ Tensor
+
+- **nn.Parameter**: all learned weights (embedding table, linear weights, `q_gain`, `attn_scale`, etc.)
+- **Plain Tensor**: all intermediate activations (matmul outputs, attention scores, residuals)
+
+Both participate in the computation graph. The difference is purely whether the optimizer updates them.
+
+---
+
+## Why `transpose(1, 2)` in attention
+
+After projection and reshape:
+
+    c_q(x)                          →  (B, T, h·d_k)   = (64, 1024, 512)
+      .reshape(B, T, h, d_k)       →  (B, T, h, d_k)   = (64, 1024, 8, 64)
+      .transpose(1, 2)              →  (B, h, T, d_k)   = (64, 8, 1024, 64)
+
+`F.scaled_dot_product_attention` expects `(B, h, T, d_k)`. With T and $d_k$ as the last two dimensions, the per-head attention $Q_i K_i^\top$ is a matmul on the trailing dims:
+
+$$(T, d_k) \times (d_k, T) \to (T, T)$$
+
+PyTorch batches this matmul over both $B$ and $h$ simultaneously in one fused kernel call (512 independent $(1024 \times 64) \times (64 \times 1024)$ matmuls: $64 \text{ seqs} \times 8 \text{ heads}$).
+
+If the shape were left as $(B, T, h, d_k)$, the matmul dims would be $(h, d_k) \times (h, d_k)^\top$ — semantically wrong.
+
+---
+
+## Why `.contiguous()` before reshape
+
+`transpose()` in PyTorch doesn't move data — it changes **stride** metadata that tells PyTorch how to index memory. After transpose, the memory layout doesn't match the logical axis order. `reshape` requires contiguous memory (or compatible strides), so:
+
+    y: (B, h, T, d_k)              # after SDPA, memory in (B, h, T, d_k) order
+      .transpose(1, 2)             # (B, T, h, d_k) — logical, but memory still h-before-T
+      .contiguous()                 # actual memory copy: rearranges data to match new axis order
+      .reshape(B, T, d_model)       # merge last two dims: (B, T, 8, 64) → (B, T, 512)
+
+Without `.contiguous()`, `reshape` would throw `RuntimeError: view size is not compatible with input tensor's size and stride`.
+
+---
+
+## What `detach().to("cpu")` means
+
+Two separate operations:
+
+- **`detach()`**: disconnects the tensor from the autograd graph. Every forward op records itself so `backward()` can trace gradients. `detach()` says "drop the graph — I only need the value." Prevents wasting memory on graph history for tensors used only for logging or saving.
+
+- **`.to("cpu")`**: moves the tensor from GPU VRAM to CPU RAM. Equivalent to `.cpu()`.
+
+Example from warmup snapshot (line 938):
+
+    {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+
+This saves an independent CPU copy of all weights: `detach` (drop graph) → `cpu` (move to RAM) → `clone` (make independent copy so later in-place GPU updates don't affect the snapshot).
+
+---
+
+## Sequence length: training vs evaluation vs production LLMs
+
+### In this codebase: $T$ is fixed at eval time too
+
+The eval function (lines 256-257) uses the same `train_seq_len`:
+
+    x = local[:-1].reshape(-1, args.train_seq_len)   # same 1024
+    y = local[1:].reshape(-1, args.train_seq_len)
+
+The validation set is simply chunked into 1024-token sequences. No long-context handling.
+
+### Why $T = 1024$ and not longer
+
+Training efficiency. With a 10-minute wall-clock cap:
+
+- Short sequences ($T = 1024$) → large batch ($B = 64$) → high GPU utilization (many parallel matmuls)
+- Long sequences ($T = 200{,}000$) → tiny batch ($B = 1$) → GPU underutilized, fewer total tokens processed
+
+The competition metric is BPB on fixed validation data, not long-range coherence. Short-context training maximizes tokens/second within the budget.
+
+### Why production models claim 200K+ context
+
+1. **They train on long sequences.** Often progressively: $4\text{K} \to 32\text{K} \to 128\text{K}$ during training stages.
+
+2. **Nothing in the math fixes $T$.** The attention equations work for any $T$. RoPE computes positional frequencies on-the-fly: `torch.arange(seq_len, ...)`, so it handles any length natively.
+
+3. **Memory is the constraint, not architecture.** Naive attention materializes the $T \times T$ score matrix: for $T = 200\text{K}$, that's $4 \times 10^{10}$ entries per head per layer. Flash Attention computes in $O(T)$ memory by tiling, making long context feasible. Compute remains $O(T^2)$.
+
+4. **Additional techniques** for very long context: RoPE frequency scaling (NTK-aware, YaRN), sliding window attention, KV-cache compression, sparse attention. This codebase uses none — it's a minimal baseline.

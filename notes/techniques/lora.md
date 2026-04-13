@@ -149,28 +149,70 @@ low-rank update, limiting expressiveness.
 
 ### The decomposition
 
-Each weight column is decomposed into magnitude and direction:
+Each **row** of the weight matrix W ∈ R^{d_out × d_in} is decomposed into a magnitude
+scalar and a unit-direction vector:
 
-    W = m · V/‖V‖
+    W_i = m_i · (V_i / ‖V_i‖)
 
-where:
-- V is the **direction** matrix (unit-normalized columns)
-- m is a learnable **magnitude** vector (one scalar per output dimension)
+where W_i, V_i ∈ R^{d_in} are the i-th row, and m_i is a scalar. In other words:
+- V ∈ R^{d_out × d_in} — the direction matrix (same shape as W)
+- m ∈ R^{d_out} — one magnitude scalar per row (per output neuron)
+- ‖V‖ means **row-wise L2 norm**, giving a vector ∈ R^{d_out}
+
+The `·` here is **broadcasting (row-wise scaling), NOT matrix multiplication**. In code:
+
+    row_norms = V.norm(dim=1, keepdim=True)  # (d_out, 1)
+    V_normed = V / row_norms                 # (d_out, d_in)
+    W = m.unsqueeze(1) * V_normed            # (d_out, 1) * (d_out, d_in) → (d_out, d_in)
+
+Equivalently `diag(m) @ V_normed`, but broadcasting is cheaper than forming a diagonal matrix.
 
 Then LoRA is applied only to the direction component:
 
-    W' = (m + Δm) · (V + BA) / ‖V + BA‖
+    V' = V + BA                                          # LoRA updates direction
+    W' = (m + Δm).unsqueeze(1) * (V' / ‖V'‖_row)       # re-scale rows by updated magnitude
 
 You train:
-1. Δm — a vector of d_out scalars (cheap, unconstrained)
-2. The usual LoRA matrices B, A (low-rank, for directional changes)
+1. Δm — a vector of d_out scalars (cheap, unconstrained, updates magnitude freely)
+2. The usual LoRA matrices B, A (low-rank, for directional changes only)
 
-### Why it beats LoRA
+### Initialization
 
-In full fine-tuning, magnitude and direction updates have different learning dynamics.
-LoRA's rank-r constraint forces both to share the same low-rank subspace. DoRA frees
-magnitude to update independently (it's just a vector, very cheap) and reserves the
-low-rank capacity entirely for directional changes.
+At init, m_i = ‖W_i‖ (the L2 norm of pretrained row i), and V = W₀. So:
+
+    W = m ⊙ (V / ‖V‖_row) = ‖W_i‖ · (W_i / ‖W_i‖) = W_i  ✓
+
+The decomposition is an identity at the start, just like standard LoRA starts at ΔW = 0.
+
+### Why separate magnitude and direction?
+
+The DoRA authors measured what full fine-tuning does to weights empirically: magnitude
+changes and direction changes of each weight row have **low correlation**. They move
+somewhat independently during training.
+
+In standard LoRA, both must be expressed through the same low-rank update BA:
+
+    W' = W₀ + BA
+
+If you want to increase row i's magnitude by 10% while rotating its direction by 5°,
+both changes compete for the limited rank-r budget. You're spending rank capacity on
+magnitude changes that only need 1 DOF per row.
+
+In DoRA:
+
+    W' = (m + Δm) ⊙ (V₀ + BA) / ‖V₀ + BA‖_row
+
+The normalization ‖V₀ + BA‖_row strips out any magnitude change BA introduces, leaving
+only the directional component. Then m handles magnitude independently.
+
+- **Magnitude** (Δm): d_out scalars, no rank constraint, each output neuron scales freely.
+  512 parameters for our model — trivially cheap.
+- **Direction** (BA): rank-r LoRA, now exclusively for rotations in direction space.
+  Doesn't waste rank on magnitude (which only needs 1 DOF per row).
+
+In a d_in-dimensional space, direction has (d_in - 1) DOF and magnitude has 1 DOF.
+LoRA conflates both into r DOF. DoRA gives magnitude its own free scalar and reserves
+all r DOF for direction.
 
 Empirically, this closes ~40-60% of the gap between LoRA and full fine-tuning across
 many benchmarks.
@@ -191,45 +233,76 @@ many benchmarks.
 
 ### The problem
 
-When you initialize LoRA, A has random values with some variance. As you change the rank,
-the magnitude of BAx changes — higher rank means more terms are summed, which increases
-the output variance.
+After training begins (B is no longer zero), the output variance of BAx scales with rank.
 
-If you double the rank from 8 to 16, the LoRA output roughly doubles in magnitude (more
-random vectors summed). This means the learning rate that worked for rank 8 is too
-aggressive for rank 16.
+Variance analysis: for z = BAx where A has entries with variance σ_A², B has variance σ_B²,
+x has variance σ_x², all independent and zero-mean:
+
+    (Ax)_k = Σ_j A_kj x_j       → Var[(Ax)_k] = d_in · σ_A² · σ_x²    (d_in terms)
+    z_i = Σ_k B_ik (Ax)_k        → Var[z_i] = r · σ_B² · d_in · σ_A² · σ_x²    (r terms)
+
+So Var[z_i] ∝ r. Doubling rank doubles the output variance.
+
+Note: at init B=0, so this doesn't matter for the first forward pass. It matters once
+training has moved B away from zero and both A, B have some learned variance.
+
+### Why not 1/√r like attention?
+
+In attention, 1/√d_k is derived from keeping the **variance of softmax inputs** stable.
+Softmax is extremely sensitive to input magnitude — saturated softmax → vanishing gradients.
+The derivation is tight: keep variance ≈ 1 going into softmax.
+
+In LoRA, the output y = W₀x + (scale)·BAx is a **linear sum**. There is no softmax or
+other scale-sensitive nonlinearity immediately after. What matters is not the absolute
+variance of BAx, but the **relative magnitude of the LoRA update vs the base output**
+and how the **effective learning dynamics** change with rank.
+
+The LoRA paper chose α/r (not α/√r) because:
+- When you increase rank, each gradient step makes a larger effective update to the output
+  (more parameters contribute independently via Adam)
+- The effective learning rate scales roughly linearly with r, not with √r
+- Dividing by r cancels this out, giving hyperparameter transfer across ranks
+
+This is a **practical convenience** for hyperparameter stability, not a variance-theoretic
+derivation like 1/√d_k. The paper tested both 1/r and 1/√r and found 1/r gave better
+transfer in practice.
 
 ### The solution
 
     output = W₀x + (α/r) · BAx
 
-- α (alpha) is a fixed hyperparameter (often set to r or 2r)
-- Dividing by r normalizes out the rank dependency
+- α (alpha) is a fixed hyperparameter (often set to r or 2r), NOT a learnable parameter
+- Dividing by r normalizes out the rank dependency on learning dynamics
 
-If you set α = r, the scale is 1.0 and the rank cancellation means changing rank doesn't
-change output magnitude. If α = 2r, the LoRA contribution is amplified by 2x.
+### What alpha values mean in practice
+
+The most common convention: **set alpha to a fixed value (16 or 32), independent of rank.**
+The /r denominator auto-compensates when rank changes — tune alpha once, vary rank freely.
+This is the Hugging Face `peft` default (lora_alpha=16).
+
+- α = 16, r = 8 (scale = 2.0): amplifies LoRA. Common default combo.
+- α = 16, r = 16 (scale = 1.0): neutral. Same alpha, different rank, auto-compensated.
+- α = 16, r = 64 (scale = 0.25): attenuates LoRA. More conservative updates.
+- α = r (scale always 1.0): simplest choice, used in tutorials. Equivalent to no scaling.
+
+Alpha is a learning rate multiplier for the LoRA path:
+`α=16, r=8, lr=0.01` ≡ `α=32, r=8, lr=0.005` (same effective update = lr × α/r × grad).
+
+The point of the α/r factorization: if you change rank from 8 to 16, you don't need to
+retune alpha or lr. Without the /r denominator, switching rank would require manually
+adjusting alpha to compensate.
 
 ### Relation to other scaling mechanisms
 
-The principle is the same as other normalizations in the model: when you sum/dot-product
-many terms, normalize to keep variance stable. But the specific formulas differ because
-they address different operations:
-
-| Where | Scaling | Why |
-|-------|---------|-----|
-| Attention | 1/√d_k | Dot product of two d_k-dim vectors has variance ~d_k; divide by √d_k → variance ~1 |
-| LoRA | α/r | Sum of r rank-1 contributions; normalize so changing r doesn't change magnitude |
-| RMSNorm | x / RMS(x) | Normalize activations to unit RMS after each layer, preventing magnitude drift across depth |
+| Where | Scaling | Why | Derivation |
+|-------|---------|-----|------------|
+| Attention | 1/√d_k | Keep softmax inputs near unit variance | Principled: Var[q·k] = d_k, so divide by √d_k |
+| LoRA | α/r | Keep learning dynamics stable across ranks | Empirical: effective LR scales ~linearly with r |
+| RMSNorm | x / RMS(x) | Normalize activations between layers | Principled: force activation RMS = 1 |
 
 RMSNorm is applied to **activations** between layers. Attention scaling and LoRA scaling
 are applied to specific **operations**. All solve the same fundamental problem (keeping
 numbers in a well-behaved range) at different points in the computation.
-
-The α/r form is partly principled (rank-normalization for hyperparameter stability) and
-partly empirical (the specific value of alpha is tuned). It's not as clean as the 1/√d_k
-derivation in attention, which follows directly from the variance of dot products. The
-original LoRA paper chose this form so you can tune alpha once and freely change rank
-without retuning learning rate.
 
 ## target_modules and gradient flow through frozen layers
 
@@ -254,31 +327,53 @@ drop-in replacement. The rest of the model sees no structural difference.
 
 ### How gradients flow through frozen layers
 
-"Frozen" does NOT mean "gradient doesn't flow through." It means "we compute the
-gradient of the loss w.r.t. the layer's input (needed for chain rule), but we don't
-compute or store the gradient w.r.t. the frozen weight itself."
+"Frozen" does NOT mean "gradient doesn't flow through." A frozen layer is treated as a
+**fixed function** f(z) = W_frozen · z where W_frozen is a constant, not a variable.
 
-Concretely, for a frozen linear layer y = Wx:
-- dL/dx = W^T · dL/dy — this IS computed, passed backward to earlier layers
-- dL/dW = dL/dy · x^T — this is NOT computed (saves memory and compute)
+The chain rule requires two different partial derivatives for a layer y = W·h:
 
-In PyTorch, setting `param.requires_grad = False`:
-1. PyTorch won't allocate a `.grad` tensor for this param (saves memory)
+    ∂y/∂h = W           (Jacobian w.r.t. the INPUT — the frozen weight's VALUE is used as a multiplier)
+    ∂y/∂W = h           (Jacobian w.r.t. the WEIGHT — the gradient OF the frozen weight)
+
+"Frozen" means: compute ∂y/∂h (needed to propagate gradient to earlier layers), but
+SKIP computing ∂y/∂W (since we won't update W). The frozen weight appears in the chain
+rule **as a constant value** we multiply by, not as something we differentiate w.r.t.
+
+Scalar example:
+
+    x = 2           (input)
+    a = 3           (trainable LoRA weight)
+    w = 5           (frozen weight)
+
+    Forward:  h = a·x = 6,  y = w·h = 30,  L = y² = 900
+
+    Backward (want dL/da):
+      dL/dy = 2y = 60
+      dy/dh = w = 5            ← frozen weight's VALUE used here as a multiplier
+      dL/dh = 60 × 5 = 300    ← gradient flows THROUGH frozen layer
+      dh/da = x = 2
+      dL/da = 300 × 2 = 600   ← stored, used to update a
+
+      dy/dw = h = 6            ← SKIPPED (requires_grad=False)
+      dL/dw = 60 × 6 = 360    ← SKIPPED, never computed or stored
+
+The frozen weight w=5 participates as a **value** (multiplier in dy/dh), but we never
+ask "how does L change if w changes?"
+
+In PyTorch, `param.requires_grad = False`:
+1. PyTorch won't allocate a .grad tensor for this param (saves memory)
 2. BUT the layer still participates in the computation graph
-3. Gradients still flow THROUGH the layer to earlier layers via dL/dx
-4. The frozen layer acts as a fixed function during backprop
+3. Gradients w.r.t. the layer's INPUT are computed using the frozen weight's value
+4. Gradients w.r.t. the frozen WEIGHT itself are not computed
 
 So when you have frozen → LoRA → frozen:
 
     loss
-      → frozen_layer_above: passes dL/dx backward, doesn't compute dL/dW
+      → frozen_layer_above: computes dL/dh = W_frozen^T · dL/dy (passes through)
+                            skips dL/dW_frozen (not needed)
       → LoRA layer: computes and stores dL/dA and dL/dB — these get updated!
       → frozen_layer_below: would pass gradient through, but if nothing below
         it needs gradients, PyTorch stops early (saves compute)
-
-The net effect is correct: only LoRA parameters get updated, but the gradients reaching
-them account for the full forward computation through all the frozen layers above and
-below.
 
 **Efficiency:** PyTorch is smart about this. If no parameter before a frozen layer
 requires gradients, the backward pass stops early — it doesn't waste compute propagating
@@ -326,6 +421,38 @@ because the same code and APIs handle all dimensionalities uniformly.
 
 So nn.Linear is essentially a wrapper around nn.Parameter (for the weight) plus optional
 bias plus a forward() that does the matmul. It IS a wrapper of nn.Parameter.
+
+### Why weight is stored as (out, in) — the "transposed" convention
+
+nn.Linear(in, out) takes arguments in the flow direction (in → out), but stores the
+weight as shape (out, in). This follows mathematical convention: a linear map
+W: R^{in} → R^{out} is written y = Wx with W ∈ R^{out × in} (rows = output features,
+columns = input features). W[i] is output neuron i's weight vector — intuitive for
+inspection.
+
+The forward pass applies it as x @ W.T (right-hand multiply with transpose):
+- x has shape (..., in), W.T has shape (in, out), result is (..., out)
+- The @ operator treats the last two dims as matrix dims and broadcasts over all leading
+  dims. So (B, T, in) @ (in, out) means: apply the same (in, out) matrix to every element
+  in the batch D = (B, T), giving (B, T, out). The weight has no batch dims — broadcasting
+  replicates it across D automatically.
+
+Why not put W on the left (W @ x.T)? For x of shape (B, T, in):
+- x.T reverses ALL dims → (in, T, B) — rarely what you want (errors in PyTorch >=1.11)
+- x.mT transposes last two dims → (B, in, T)
+- Either way, W @ (transposed x) gives a result with batch dims in wrong positions,
+  requiring extra transposes to restore (B, T, out) shape.
+
+In simple math/derivations, we write y = Wx or y = BAx with x ∈ R^{d_in} (no batch dims).
+This is clean for reasoning about a single vector. But in code, x has shape (B, T, d_in),
+so we need x @ W.T (right-multiply) to let matmul broadcasting handle D = (B, T).
+
+The W.T transpose is free in PyTorch — it's a view (changed stride metadata), not a copy.
+
+For LoRA, this convention gives A shape (rank, d_in) and B shape (d_out, rank). Forward:
+x @ A.T @ B.T = x @ (BA).T — same convention as standard nn.Linear. If A were stored
+as (d_in, rank) and B as (rank, d_out), we could write x @ A @ B (cleaner), but it
+would break the universal "first dim = output dim" convention.
 
 ### Can you use nn.Linear for LoRA matrices?
 
