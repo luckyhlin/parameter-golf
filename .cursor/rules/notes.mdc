@@ -1,0 +1,58 @@
+---
+description: Document valuable conversation insights, experiment results, and decisions into the notes/ directory.
+globs:
+alwaysApply: true
+---
+
+# Notes Documentation Rule
+
+## Before answering questions
+
+- Check existing files in `notes/` for prior analysis before re-deriving answers from code
+- Reference and build on existing notes rather than duplicating them
+
+## Documenting insights — the 3-step process
+
+After each assistant response, apply these steps:
+
+### 1. Identify
+
+Is the recent exchange non-trivial? Skip documentation for simple factual lookups, one-line answers, or pure tool operations. Document when:
+- A training run completes or is compared to another
+- A bug is diagnosed and fixed
+- An architectural or design decision is discussed with trade-offs
+- New understanding of the codebase, tooling, or ML concepts is gained
+- A technique (TTT, quantization, activation function, etc.) is analyzed
+
+### 2. Classify
+
+Assign the insight to one or more categories. Each category maps to a file:
+
+| Category | File |
+|----------|------|
+| Experiment results & comparisons | `notes/experiment-runs.md` |
+| Code walkthrough & architecture | `notes/baseline-code-walkthrough.md` |
+| Hardware & compute analysis | `notes/3060-vs-leaderboard.md` |
+| Techniques & algorithms (TTT, quantization, etc.) | `notes/techniques/<name>.md` |
+| Debugging & fixes | `notes/debugging.md` |
+| ML fundamentals & concepts | `notes/fundamentals.md` |
+
+Create new files/subdirectories as needed if a topic doesn't fit existing categories.
+
+### 3. Write
+
+- Update the appropriate file(s) immediately — don't wait and don't ask permission
+- Before writing, read the target file to check for existing coverage
+- If the topic is already covered, update/extend rather than duplicate
+- If prior understanding is corrected, fix the existing note in-place
+- **Write detailed explanations, not telegraphic summaries.** These notes are a learning reference — include the "why", worked examples with concrete numbers, analogies to related concepts, and the intuition behind formulas. A reader should be able to understand the topic from the notes alone without needing to re-ask.
+- Use math notation where it helps (inline LaTeX-style or plain Unicode)
+- Include concrete examples with real dimensions from this project (e.g., d_model=512, vocab=1024)
+- Include dates on time-sensitive entries (experiments, debugging)
+- Reference relevant code (file + line) when discussing implementation
+
+## Experiment run logs
+
+- Keep a running log at `notes/experiment-runs.md` tracking all training runs
+- Each run entry must include: RUN_ID, env vars / hyperparameters changed from defaults, key metrics (val_loss, val_bpb, peak memory, steps completed, wall time), and any observations
+- Use a consistent table or structured format for easy comparison

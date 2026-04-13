@@ -489,6 +489,48 @@ differently:
   are never updated during warmup. Then resets only the data loader. This is
   cheaper because there's no snapshot/restore overhead.
 
+### PyTorch warmup detail (train_gpt.py lines 935-961)
+
+The warmup is NOT a learning rate warmup — it is a `torch.compile` / CUDA
+warmup. The first time a compiled model runs forward/backward, PyTorch traces
+and JIT-compiles CUDA kernels, which is very slow. By doing this before the
+training clock starts, measured training time excludes compilation overhead.
+
+Sequence:
+1. Snapshot model weights + all optimizer states to CPU (lines 938-939)
+2. Run `warmup_steps` (default 20) full training steps: forward, backward,
+   optimizer step — all real ops on real data (lines 941-951)
+3. Restore the original weights and optimizer states (lines 955-957)
+4. Reset the data loader so training sees data from the beginning (line 961)
+
+The weights and optimizer state changes from warmup are completely discarded.
+Training starts from the true initial state, but with all compiled kernels
+already cached. The warmup runs before the training clock starts, so it does
+not consume any of the 600s training budget.
+
+Why 20 steps (not 1): `torch.compile` compilation itself finishes on the first
+invocation, but PyTorch/cuDNN also runs kernel autotuning — benchmarking
+multiple kernel implementations for each op and caching the fastest. This
+autotuning takes several iterations to settle. By step 20, all kernel
+selections are stable and the CUDA caching allocator has a steady allocation
+pattern. On 8×H100 (~86ms/step) this costs ~1.7s of wall-clock; on a 3060
+(~849ms/step) it costs ~17s but still doesn't affect the training budget.
+
+### The 5 sequential stages of train_gpt.py
+
+1. **Compile warmup** — prime `torch.compile` paths, discard results
+   (lines 937-961)
+2. **Training loop** — actual optimization with periodic validation
+   (lines 972-1055). Validation runs every `val_loss_every` steps and once
+   at the final step via `eval_val()`.
+3. **Serialization** — save raw f32 model + int8 quantize + zlib compress
+   to `final_model.int8.ptz` (lines 1068-1092)
+4. **Roundtrip reload** — load the compressed artifact from disk, dequantize
+   back to float, replace model weights (lines 1096-1100)
+5. **Post-quantization validation** — evaluate the round-tripped int8 model
+   to report the final `val_bpb` score that matters for the competition
+   (lines 1102-1118)
+
 ### SDP backend selection
 
 The Torch version explicitly selects Flash Attention as the only scaled dot
@@ -659,57 +701,9 @@ non-standard operations (custom XSA, QAT-aware forward, fused quantization).
 
 ---
 
-## What is TTT (Test-Time Training)?
+## TTT (Test-Time Training)
 
-TTT is an EVALUATION-TIME technique, not a training technique. It uses the
-separate 10-min eval budget.
-
-### Protocol (from the Legal TTT submission)
-
-    For each chunk of validation tokens:
-      1. SCORE: Run model on chunk → accumulate loss/bytes for BPB
-         (this counts toward the official score — already graded)
-      2. TRAIN: Fine-tune model on the already-scored tokens
-         (legal because tokens are already evaluated)
-      3. Next chunk benefits from the adapted model
-
-    Reset model between documents (no cross-document leakage)
-
-The model adapts to each document's patterns during evaluation, so later tokens
-get better predictions. Like a human reader "getting used to" an author's style.
-
-### TTT is NOT depth recurrence
-
-"11L" means 11 distinct transformer layers with independent weights.
-It is NOT running the same layer 11 times (that would be depth recurrence /
-Universal Transformer — still on the README's wishlist).
-
-TTT is about adapting the WEIGHTS during evaluation. Depth recurrence is about
-reusing the same weights for multiple forward passes.
-
-### Impact (from leaderboard submissions)
-
-LoRA TTT ablation (on naive baseline):
-
-    Baseline (cross-doc, flat stream)     1.2278
-    + Document-isolated eval              1.2168  (-0.0110)
-    + Stride (chunk=256)                  1.1941  (-0.0337)
-    + LoRA TTT                            1.1910  (-0.0368)
-
-Most gain came from smarter eval strategy (doc isolation + striding), not TTT.
-
-The current #1 entry (1.1147) DROPPED TTT entirely — better GPTQ quantization
-more than compensated for the -0.0025 bpb TTT gain, and TTT conflicted with
-their other techniques.
-
-### TTT timing breakdown (from Legal TTT submission)
-
-    Phase                                   Time
-    ─────────────────────────────────────── ──────
-    Training                                600s (10 min cap)
-    Standard eval (int6 roundtrip + sliding) ~120s
-    Legal TTT (score-first + adaptation)    ~410s
-    Total eval                              ~530s (< 10 min eval cap)
+Moved to `notes/techniques/ttt.md`.
 
 ---
 
