@@ -13,6 +13,8 @@ Tokenizer: `fineweb_1024_bpe.model` (vocab_size=1024), dataset: `fineweb10B_sp10
 | leaky_relu | 2025-04-10 | LeakyReLU(0.5)² | 707 | 849ms | 1.5530 | 1.5556 | 1891 MiB | 11.28 MB |
 | leaky_relu_11L | 2025-04-11 | LeakyReLU(0.5)² + NUM_LAYERS=11 | 517 | 1162ms | 1.6170 | 1.6230 | 2216 MiB | 12.22 MB |
 | leaky_relu_11L_mlp3x | 2025-04-11 | LeakyReLU(0.5)² + NUM_LAYERS=11 MLP_MULT=3 | 508 | 1182ms | 1.5980 | 1.6028 | 2501 MiB | 15.25 MB |
+| gla-fp32 | 2025-04-13 | GLA attention (fp32 chunk loop) | 405 | 1482ms | 1.8199 | 1.8270 | 2631 MiB | 11.79 MB |
+| gla-bf16-fixed | 2025-04-13 | GLA attention (bf16 chunk loop, fixed reshape) | 495 | 1213ms | 1.7846 | 1.7894 | 2609 MiB | 12.45 MB |
 
 Common settings: TRAIN_BATCH_TOKENS=65536, VAL_BATCH_SIZE=65536, grad_accum_steps=8 (default 8//1), vocab_size=1024, seq_len=1024, iterations=20000, warmup_steps=20, max_wallclock=600s. Model defaults (unless noted): model_dim=512, num_layers=9, num_heads=8, num_kv_heads=4, mlp_mult=2
 
@@ -152,3 +154,57 @@ become much smaller in absolute magnitude (power law diminishing returns), so th
 3.1% relative penalty on D shrinks in absolute impact, while the N benefit stays
 proportionally the same. Result: bigger model wins when data is abundant, loses
 when data-starved.
+
+### gla-fp32 — GLA attention, fp32 chunk loop (train_gpt_linear.py)
+
+Script: `train_gpt_linear.py` — replaces CausalSelfAttention with GatedLinearAttention.
+Chunk loop runs in fp32 (wrapped in `torch.autocast(enabled=False)`).
+
+**Command:**
+```bash
+RUN_ID=gla-fp32 TRAIN_BATCH_TOKENS=65536 \
+  torchrun --standalone --nproc_per_node=1 train_gpt_linear.py
+```
+
+**Key metrics:**
+- model_params: 19,494,160 (more than softmax baseline due to gate_proj, g_proj)
+- step_avg: ~1,482ms, 405 steps in 600s
+- val_loss: 3.0728 → val_bpb: 1.8199
+- int8+zlib roundtrip: val_loss=3.0848, val_bpb=1.8270
+- Peak memory: 2631 MiB
+
+**Observations:**
+- Slower than softmax baseline (1482ms vs 902ms) — fp32 einsum dominates
+- Worse val_bpb (1.82 vs 1.57) — fewer steps + GLA architecture not yet tuned
+- Log: `logs/gla-0413-1541.txt`
+
+### gla-bf16-fixed — GLA attention, bf16 chunk loop (fixed reshape)
+
+Same as gla-fp32 but chunk loop runs in bf16 under autocast. The critical fix:
+`output.reshape(B, H, T, d)` merges chunk dims before transposing (not after).
+
+**Command:**
+```bash
+RUN_ID=gla-bf16-fixed TRAIN_BATCH_TOKENS=65536 \
+  torchrun --standalone --nproc_per_node=1 train_gpt_linear.py
+```
+
+**Key metrics:**
+- model_params: 19,494,160
+- step_avg: ~1,213ms, 495 steps in 600s
+- val_loss: 3.0132 → val_bpb: 1.7846
+- int8+zlib roundtrip: val_loss=3.0213, val_bpb=1.7894
+- Peak memory: 2609 MiB
+
+**Observations:**
+- **18% faster** than fp32 GLA (1213ms vs 1482ms), 22% more steps (495 vs 405)
+- **Better val_bpb** (1.7846 vs 1.8199) — more steps more than compensate for any bf16 precision loss
+- Still worse than softmax baseline (1.78 vs 1.57) — GLA architecture needs tuning
+- Log: `logs/gla-bf16-fixed-0413-2152.txt`
+
+#### Historical note: the bf16 reshape bug
+
+An earlier bf16 version (log: `logs/gla-bf16-0413-1706.txt`) produced val_bpb=0.04 —
+impossibly good. Root cause: the 5D tensor reshape at the end of the GLA forward
+mixed sequence positions within each chunk, creating a learnable bidirectional leak.
+Full debugging writeup: `notes/debugging.md`. Debug scripts: `debug_scripts/bf16_gla_reshape_bug/`.

@@ -69,6 +69,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    chunk_size = int(os.environ.get("CHUNK_SIZE", 64))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -289,7 +290,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,g_proj,gate_proj",
     ).split(",")
     if pattern
 )
@@ -521,45 +522,27 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
-class Rotary(nn.Module):
-    # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, dim: int, base: float = 10000.0):
-        super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._seq_len_cached = 0
-        self._cos_cached: Tensor | None = None
-        self._sin_cached: Tensor | None = None
+class GatedLinearAttention(nn.Module):
+    """
+    Gated Linear Attention — O(T) complexity attention variant.
 
-    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        if (
-            self._cos_cached is None
-            or self._sin_cached is None
-            or self._seq_len_cached != seq_len
-            or self._cos_cached.device != device
-        ):
-            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device))
-            self._cos_cached = freqs.cos()[None, None, :, :]
-            self._sin_cached = freqs.sin()[None, None, :, :]
-            self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+    Replaces softmax attention with a gated recurrent KV state:
+        S_t = gate_t * S_{t-1} + k_t^T @ v_t
+        o_t = q_t @ S_t
 
+    Uses chunk-wise parallelism for GPU efficiency:
+    - Intra-chunk: O(C^2) quadratic attention (C is small constant)
+    - Inter-chunk: O(d^2) state propagation per chunk
+    - Total: O(T * (C + d^2/C)) = O(T) for fixed C and d
+    """
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-
-
-class CausalSelfAttention(nn.Module):
     def __init__(
         self,
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_base: float,
         qk_gain_init: float,
+        chunk_size: int = 64,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -569,37 +552,82 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
+        self.chunk_size = chunk_size
+        self.gate_logit_normalizer = 16
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.gate_proj = nn.Sequential(
+            CastedLinear(dim, 16, bias=False),
+            CastedLinear(16, num_heads, bias=True),
+        )
+        with torch.no_grad():
+            self.gate_proj[1].bias.fill_(5.0)
+        self.g_proj = CastedLinear(dim, dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.qk_scale = self.head_dim ** -0.5
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        H, d = self.num_heads, self.head_dim
+        C = self.chunk_size
+        NC = seqlen // C
+
+        q = self.c_q(x).reshape(bsz, seqlen, H, d).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, d).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, d).transpose(1, 2)
+
+        if self.num_kv_heads != H:
+            reps = H // self.num_kv_heads
+            k = k[:, :, None, :, :].expand(-1, -1, reps, -1, -1).reshape(bsz, H, seqlen, d)
+            v = v[:, :, None, :, :].expand(-1, -1, reps, -1, -1).reshape(bsz, H, seqlen, d)
+
+        q = F.rms_norm(q, (d,))
+        k = F.rms_norm(k, (d,))
+        v = F.rms_norm(v, (d,))
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        k = k * self.qk_scale
+
+        log_gate = (F.logsigmoid(self.gate_proj(x)) / self.gate_logit_normalizer).float()
+        log_gate = log_gate.clamp(min=-1.0)
+        log_gate = log_gate.permute(0, 2, 1)
+
+        qc = q.reshape(bsz, H, NC, C, d)
+        kc = k.reshape(bsz, H, NC, C, d)
+        vc = v.reshape(bsz, H, NC, C, d)
+        lg = log_gate.reshape(bsz, H, NC, C)
+
+        causal_mask = torch.tril(torch.ones(C, C, device=x.device, dtype=q.dtype))
+        output = torch.empty_like(qc)
+        state = torch.zeros(bsz, H, d, d, device=x.device, dtype=torch.float32)
+
+        for c_idx in range(NC):
+            q_c = qc[:, :, c_idx]
+            k_c = kc[:, :, c_idx]
+            v_c = vc[:, :, c_idx]
+            cum_lg = torch.cumsum(lg[:, :, c_idx], dim=-1)
+
+            decay = (torch.exp(cum_lg.unsqueeze(-1) - cum_lg.unsqueeze(-2)) * causal_mask).to(q.dtype)
+
+            attn = torch.einsum('bhid,bhjd->bhij', q_c, k_c)
+            o_intra = torch.einsum('bhij,bhjd->bhid', attn * decay, v_c)
+
+            decay_from_state = torch.exp(cum_lg).to(q.dtype).unsqueeze(-1)
+            o_inter = torch.einsum('bhid,bhde->bhie', q_c, state.to(q.dtype)) * decay_from_state
+
+            output[:, :, c_idx] = o_intra + o_inter
+
+            chunk_decay = torch.exp(cum_lg[:, :, -1])
+            state = state * chunk_decay[:, :, None, None]
+            d2e = torch.exp(cum_lg[:, :, -1:] - cum_lg).to(q.dtype)
+            state = state + torch.einsum('bhc,bhci,bhcj->bhij', d2e, k_c, v_c).float()
+
+        y = F.rms_norm(output.reshape(bsz, H, seqlen, d), (d,))
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        y = y * F.silu(self.g_proj(x))
         return self.proj(y)
 
 
@@ -624,13 +652,13 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
-        rope_base: float,
         qk_gain_init: float,
+        chunk_size: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = GatedLinearAttention(dim, num_heads, num_kv_heads, qk_gain_init, chunk_size)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -657,8 +685,8 @@ class GPT(nn.Module):
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
-        rope_base: float,
         qk_gain_init: float,
+        chunk_size: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -678,8 +706,8 @@ class GPT(nn.Module):
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
-                    rope_base,
                     qk_gain_init,
+                    chunk_size,
                 )
                 for i in range(num_layers)
             ]
@@ -761,12 +789,6 @@ def main() -> None:
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
 
     logfile = None
     losscsv = None
@@ -836,14 +858,18 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        chunk_size=args.chunk_size,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if os.environ.get("NO_COMPILE", ""):
+        compiled_model = base_model
+        log0("torch.compile DISABLED via NO_COMPILE env var")
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -898,8 +924,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:gated_linear_attention num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} chunk_size:{args.chunk_size}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1011,18 +1036,40 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        nan_in_step = False
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+            if loss.detach().isnan().any() or loss.detach().isinf().any():
+                nan_in_step = True
+                del loss, x, y
+                torch.cuda.empty_cache()
+                break
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        if losscsv is not None:
+
+        if not nan_in_step and losscsv is not None:
             elapsed = training_time_ms + 1000.0 * (time.perf_counter() - t0)
             losscsv.write(f"{step},{train_loss.item():.6f},{elapsed:.0f}\n")
+
+        if nan_in_step:
+            nan_consec = getattr(main, '_nan_consec', 0) + 1
+            nan_total = getattr(main, '_nan_total', 0) + 1
+            main._nan_consec = nan_consec
+            main._nan_total = nan_total
+            log0(f"step:{step} NaN/Inf in forward pass (consecutive={nan_consec} total={nan_total}), skipping step")
+            zero_grad_all()
+            if nan_consec >= 5:
+                log0(f"Stopping: {nan_consec} consecutive NaN steps")
+                break
+            step += 1
+            continue
+        else:
+            main._nan_consec = 0
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1046,9 +1093,20 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            diag_parts = []
+            for blk_idx, blk in enumerate(base_model.blocks):
+                attn = blk.attn
+                for pname, p in attn.named_parameters():
+                    if p.grad is not None and (p.grad.isnan().any() or p.grad.isinf().any()):
+                        diag_parts.append(f"blk{blk_idx}.attn.{pname}:grad_bad")
+                    pmax = p.detach().abs().max().item()
+                    if pmax > 100:
+                        diag_parts.append(f"blk{blk_idx}.attn.{pname}:w={pmax:.1f}")
+            diag_str = f" diag:[{','.join(diag_parts)}]" if diag_parts else ""
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"{diag_str}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
